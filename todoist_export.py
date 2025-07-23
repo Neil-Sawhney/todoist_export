@@ -1,0 +1,594 @@
+#!/usr/bin/env python3
+import json
+from datetime import datetime
+
+import pandas as pd
+import requests
+
+
+def get_all_tasks(api_token):
+    import time
+
+    print("Collecting Todoist Tasks using Sync API and completed/get_all...")
+    headers = {"Authorization": f"Bearer {api_token}"}
+
+    # 1. Get all active tasks, projects, labels, notes, sections using Sync API
+    sync_url = "https://api.todoist.com/sync/v9/sync"
+    sync_data = {
+        "sync_token": "*",
+        "resource_types": '["all"]',
+    }
+    from datetime import datetime, timezone
+
+    resp = requests.post(sync_url, headers=headers, data=sync_data)
+    resp.raise_for_status()
+    result = resp.json()
+    # Check full_sync_date_utc and do incremental sync if needed
+    full_sync_date_utc = result.get("full_sync_date_utc")
+    sync_token = result.get("sync_token")
+    now_utc = datetime.now(timezone.utc)
+    needs_incremental = False
+    if full_sync_date_utc:
+        try:
+            sync_time = datetime.fromisoformat(
+                full_sync_date_utc.replace("Z", "+00:00")
+            )
+            # If the sync is more than 60 seconds old, do incremental sync
+            if abs((now_utc - sync_time).total_seconds()) > 60:
+                needs_incremental = True
+        except Exception:
+            pass
+    if needs_incremental and sync_token:
+        print("Full sync is not up-to-date. Performing incremental sync...")
+        inc_data = {
+            "sync_token": sync_token,
+            "resource_types": '["all"]',
+        }
+        inc_resp = requests.post(sync_url, headers=headers, data=inc_data)
+        inc_resp.raise_for_status()
+        inc_result = inc_resp.json()
+        # Merge incremental results into main result
+        for key in ["items", "projects", "sections", "notes"]:
+            if key in inc_result:
+                result.setdefault(key, [])
+                result[key].extend(inc_result[key])
+    items = result.get("items", [])
+    projects = {p["id"]: p["name"] for p in result.get("projects", [])}
+    sections = {s["id"]: s["name"] for s in result.get("sections", [])}
+    notes = result.get("notes", [])
+    notes_by_item = {}
+    for note in notes:
+        notes_by_item.setdefault(note["item_id"], []).append(note)
+    id_to_item = {item["id"]: item for item in items}
+
+    # Build user id to name mapping (if available)
+    users = result.get("collaborators", [])
+    user_id_to_name = {
+        u["id"]: u.get("full_name") or u.get("email") or str(u["id"]) for u in users
+    }
+
+    # 2. Get all completed tasks using completed/get_all (with pagination)
+    completed_url = "https://api.todoist.com/sync/v9/completed/get_all"
+    completed_items = []
+    offset = 0
+    limit = 200
+    since = "2000-01-01T00:00:00Z"
+    while True:
+        params = {
+            "limit": limit,
+            "offset": offset,
+            "annotate_items": "true",
+            "since": since,
+        }
+        resp = requests.get(completed_url, headers=headers, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        completed_batch = data.get("items", [])
+        completed_items.extend(completed_batch)
+        if len(completed_batch) < limit:
+            break
+        offset += limit
+        time.sleep(0.2)  # avoid rate limits
+    completed_projects = data.get("projects", {})
+
+    # 2b. Get archived completed tasks from /archive/items (new in v9)
+    archive_url = "https://api.todoist.com/sync/v9/archive/items"
+    archived_items = []
+    offset = 0
+    limit = 200
+    try:
+        while True:
+            params = {
+                "limit": limit,
+                "offset": offset,
+            }
+            resp = requests.get(archive_url, headers=headers, params=params)
+            if resp.status_code == 400:
+                print(
+                    "Warning: /archive/items endpoint not available or not supported for this account. Skipping archived completed tasks."
+                )
+                archived_items = []
+                break
+            resp.raise_for_status()
+            data = resp.json()
+            batch = data.get("items", [])
+            archived_items.extend(batch)
+            if len(batch) < limit:
+                break
+            offset += limit
+            time.sleep(0.2)
+    except Exception as e:
+        print(f"Warning: Failed to fetch archived completed tasks: {e}")
+        archived_items = []
+
+    # Deduplicate archived_items and completed_items by task id
+    completed_ids = set(c.get("task_id") for c in completed_items)
+    # Only add archived items not already in completed_items
+    archived_new = [a for a in archived_items if a.get("id") not in completed_ids]
+
+    # 3. Normalize active tasks (include all subtasks, sections, etc.)
+    all_tasks = []
+    for item in items:
+        created_at = item.get("created_at", "")
+        completed_at = item.get("completed_at", "")
+        project_id = item.get("project_id")
+        project_name = projects.get(project_id, "")
+        section_id = item.get("section_id")
+        section_name = sections.get(section_id, "") if section_id else ""
+        parent_id = item.get("parent_id")
+        parent_content = (
+            id_to_item[parent_id]["content"] if parent_id in id_to_item else ""
+        )
+        assignee_id = item.get("responsible_uid") or item.get("assignee_id") or ""
+        assignee = (
+            user_id_to_name.get(str(assignee_id), assignee_id) if assignee_id else ""
+        )
+        subtasks = [t["content"] for t in items if t.get("parent_id") == item["id"]]
+        comment_list = [n["content"] for n in notes_by_item.get(item["id"], [])]
+        comments = "\n".join(comment_list)
+        attachments = []
+        for n in notes_by_item.get(item["id"], []):
+            if n.get("file_url"):
+                fname = n.get("file_name") or n.get("file_url")
+                attachments.append(f'=HYPERLINK("{n["file_url"]}", "{fname}")')
+        labels = ", ".join(item.get("labels", []))
+        task_description = item.get("description", "")
+        # Task link
+        task_link = f'https://todoist.com/showTask?id={item.get("id", "")}'
+        task_info = {
+            "taskId": item.get("id", ""),
+            "taskName": item.get("content", ""),
+            "taskLink": task_link,
+            "sectionId": section_id or "",
+            "parentTaskId": parent_id or "",
+            "parentTask": parent_content,
+            "completed": "Yes" if item.get("is_completed") else "No",
+            "due": item["due"]["string"] if item.get("due") else "No due date",
+            "priority": item.get("priority", ""),
+            "description": task_description,
+            "comments": comments,
+            "section": section_name,
+            "assignee": assignee,
+            "createdDate": created_at,
+            "labels": labels,
+            "completedDate": completed_at,
+            "project": project_name,
+        }
+        all_tasks.append(task_info)
+
+    # 4. Normalize completed tasks
+    for citem in completed_items:
+        # If annotate_items is true, use the full item object for more details
+        item_obj = citem.get("item_object", {})
+        content = citem.get("content") or item_obj.get("content", "")
+        description = item_obj.get("description", "")
+        project_id = citem.get("project_id") or item_obj.get("project_id")
+        project_name = projects.get(project_id) or completed_projects.get(
+            str(project_id), {}
+        ).get("name", "")
+        section_id = item_obj.get("section_id") or ""
+        section_name = sections.get(section_id, "") if section_id else ""
+        parent_id = item_obj.get("parent_id") or ""
+        parent_content = item_obj.get("parent_content", "")
+        if not parent_content and parent_id:
+            parent_content = (
+                id_to_item[parent_id]["content"] if parent_id in id_to_item else ""
+            )
+        assignee_id = (
+            item_obj.get("responsible_uid") or item_obj.get("assignee_id") or ""
+        )
+        assignee = (
+            user_id_to_name.get(str(assignee_id), assignee_id) if assignee_id else ""
+        )
+        created_at = item_obj.get("created_at", "")
+        completed_at = citem.get("completed_at", "")
+        priority = item_obj.get("priority", "")
+        labels = ", ".join(item_obj.get("labels", []))
+        due = (
+            item_obj.get("due", {}).get("string")
+            if item_obj.get("due")
+            else "No due date"
+        )
+        # Comments for completed tasks
+        comment_list = [
+            n["content"] for n in notes_by_item.get(citem.get("task_id", ""), [])
+        ]
+        comments = "\n".join(comment_list)
+        task_link = f'https://todoist.com/showTask?id={citem.get("task_id", "")}'
+        task_info = {
+            "taskId": citem.get("task_id", ""),
+            "taskName": content,
+            "taskLink": task_link,
+            "sectionId": section_id,
+            "parentTaskId": parent_id,
+            "parentTask": parent_content,
+            "completed": "Yes",
+            "due": due,
+            "priority": priority,
+            "description": description,
+            "comments": comments,
+            "section": section_name,
+            "assignee": assignee,
+            "createdDate": created_at,
+            "labels": labels,
+            "completedDate": completed_at,
+            "project": project_name,
+        }
+        all_tasks.append(task_info)
+
+    # 5. Normalize archived completed tasks
+    for aitem in archived_new:
+        # archived items are in the same format as active items, but are completed
+        content = aitem.get("content", "")
+        description = aitem.get("description", "")
+        project_id = aitem.get("project_id", "")
+        project_name = projects.get(project_id) or completed_projects.get(
+            str(project_id), {}
+        ).get("name", "")
+        section_id = aitem.get("section_id", "")
+        section_name = sections.get(section_id, "") if section_id else ""
+        parent_id = aitem.get("parent_id", "")
+        parent_content = (
+            id_to_item[parent_id]["content"] if parent_id in id_to_item else ""
+        )
+        assignee_id = aitem.get("responsible_uid") or aitem.get("assignee_id") or ""
+        assignee = (
+            user_id_to_name.get(str(assignee_id), assignee_id) if assignee_id else ""
+        )
+        created_at = aitem.get("created_at", "")
+        completed_at = aitem.get("completed_at", "")
+        priority = aitem.get("priority", "")
+        labels = ", ".join(aitem.get("labels", []))
+        due = aitem.get("due", {}).get("string") if aitem.get("due") else "No due date"
+        # Comments for archived completed tasks
+        comment_list = [
+            n["content"] for n in notes_by_item.get(aitem.get("id", ""), [])
+        ]
+        comments = "\n".join(comment_list)
+        task_link = f'https://todoist.com/showTask?id={aitem.get("id", "")}'
+        task_info = {
+            "taskId": aitem.get("id", ""),
+            "taskName": content,
+            "taskLink": task_link,
+            "sectionId": section_id,
+            "parentTaskId": parent_id,
+            "parentTask": parent_content,
+            "completed": "Yes",
+            "due": due,
+            "priority": priority,
+            "description": description,
+            "comments": comments,
+            "section": section_name,
+            "assignee": assignee,
+            "createdDate": created_at,
+            "labels": labels,
+            "completedDate": completed_at,
+            "project": project_name,
+        }
+        all_tasks.append(task_info)
+    print(f"Collected {len(all_tasks)} tasks (active + completed).")
+    return all_tasks
+
+
+def export_to_excel(tasks, filename):
+    print(f"Exporting data to {filename}...")
+    import openpyxl
+    from openpyxl.worksheet.datavalidation import DataValidation
+    from openpyxl.worksheet.table import Table, TableStyleInfo
+
+    # DataFrame from tasks
+    df = pd.DataFrame(tasks)
+    if "comments" not in df.columns:
+        df["comments"] = ""
+    # Remove taskId and sectionId columns if present
+    drop_cols = [c for c in ("taskId", "sectionId") if c in df.columns]
+    if drop_cols:
+        df = df.drop(columns=drop_cols)
+    col_order = ["taskName", "description", "comments"] + [
+        col for col in df.columns if col not in ("taskName", "description", "comments")
+    ]
+    df = df[col_order]
+    with pd.ExcelWriter(filename, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Tasks")
+        workbook = writer.book
+        worksheet = writer.sheets["Tasks"]
+        tab = Table(displayName="TasksTable", ref=worksheet.dimensions)
+        style = TableStyleInfo(
+            name="TableStyleMedium9",
+            showFirstColumn=False,
+            showLastColumn=False,
+            showRowStripes=True,
+            showColumnStripes=False,
+        )
+        tab.tableStyleInfo = style
+        worksheet.add_table(tab)
+
+        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+        from openpyxl.utils import get_column_letter
+
+        col_map = {
+            cell.value: idx + 1
+            for idx, cell in enumerate(next(worksheet.iter_rows(min_row=1, max_row=1)))
+        }
+
+        # Helper to add dropdown for a column from unique values
+        def add_dropdown(col_name, allow_blank=True):
+            if col_name in col_map:
+                unique_vals = sorted(
+                    set(
+                        str(v)
+                        for v in df[col_name].dropna().unique()
+                        if str(v).strip() != ""
+                    )
+                )
+                if unique_vals:
+                    # Escape quotes for Excel
+                    safe_vals = [v.replace('"', '""') for v in unique_vals]
+                    # Excel list validation max length is 255 chars, so fallback to range if too long
+                    formula = '"' + ",".join(safe_vals) + '"'
+                    if len(formula) > 255:
+                        # Write to a hidden sheet and reference range
+                        if "Dropdowns" not in workbook.sheetnames:
+                            dropdown_ws = workbook.create_sheet("Dropdowns")
+                            dropdown_ws.sheet_state = "hidden"
+                        else:
+                            dropdown_ws = workbook["Dropdowns"]
+                        dropdown_ws.append([col_name])
+                        for v in safe_vals:
+                            dropdown_ws.append([v])
+                        start_row = dropdown_ws.max_row - len(safe_vals) + 1
+                        end_row = dropdown_ws.max_row
+                        col_letter = get_column_letter(1)
+                        formula = f"=Dropdowns!${col_letter}${start_row}:${col_letter}${end_row}"
+                    dv = DataValidation(
+                        type="list", formula1=formula, allow_blank=allow_blank
+                    )
+                    worksheet.add_data_validation(dv)
+                    col_letter = get_column_letter(col_map[col_name])
+                    dv.add(f"{col_letter}2:{col_letter}{len(df)+1}")
+
+        # Section dropdown and color coding (cell only)
+        if "section" in col_map:
+            unique_sections = sorted(set(df["section"].dropna().unique()))
+            if unique_sections:
+                dv_section = DataValidation(
+                    type="list",
+                    formula1='"' + ",".join(unique_sections) + '"',
+                    allow_blank=True,
+                )
+                worksheet.add_data_validation(dv_section)
+                col_letter = get_column_letter(col_map["section"])
+                dv_section.add(f"{col_letter}2:{col_letter}{len(df)+1}")
+                # Color code only the section cell
+                section_colors = [
+                    "FFEBEE",
+                    "E3F2FD",
+                    "E8F5E9",
+                    "FFFDE7",
+                    "F3E5F5",
+                    "FBE9E7",
+                    "E0F2F1",
+                    "FFF3E0",
+                ]
+                section_color_map = {
+                    s: section_colors[i % len(section_colors)]
+                    for i, s in enumerate(unique_sections)
+                }
+                for row in range(2, len(df) + 2):
+                    section_val = worksheet[f"{col_letter}{row}"].value
+                    if section_val in section_color_map:
+                        cell = worksheet[f"{col_letter}{row}"]
+                        cell.fill = PatternFill(
+                            start_color=section_color_map[section_val],
+                            end_color=section_color_map[section_val],
+                            fill_type="solid",
+                        )
+                        cell.alignment = Alignment(
+                            wrap_text=True, vertical="center", horizontal="center"
+                        )
+                        cell.font = Font(bold=True)
+
+        # Color code only the project, assignee, and labels cells, and center+bold
+        def color_cells_by_value(col_name, color_palette):
+            if col_name in col_map:
+                unique_vals = sorted(set(df[col_name].dropna().unique()))
+                val_color_map = {
+                    v: color_palette[i % len(color_palette)]
+                    for i, v in enumerate(unique_vals)
+                }
+                col_letter = get_column_letter(col_map[col_name])
+                for row in range(2, len(df) + 2):
+                    val = worksheet[f"{col_letter}{row}"].value
+                    if val in val_color_map:
+                        cell = worksheet[f"{col_letter}{row}"]
+                        cell.fill = PatternFill(
+                            start_color=val_color_map[val],
+                            end_color=val_color_map[val],
+                            fill_type="solid",
+                        )
+                        cell.alignment = Alignment(
+                            wrap_text=True, vertical="center", horizontal="center"
+                        )
+                        cell.font = Font(bold=True)
+
+        # Color code completed column cells and center+bold
+        if "completed" in col_map:
+            completed_colors = {"Yes": "C8E6C9", "No": "FFCDD2"}
+            col_letter = get_column_letter(col_map["completed"])
+            for row in range(2, len(df) + 2):
+                val = worksheet[f"{col_letter}{row}"].value
+                if val in completed_colors:
+                    cell = worksheet[f"{col_letter}{row}"]
+                    cell.fill = PatternFill(
+                        start_color=completed_colors[val],
+                        end_color=completed_colors[val],
+                        fill_type="solid",
+                    )
+                    cell.alignment = Alignment(
+                        wrap_text=True, vertical="center", horizontal="center"
+                    )
+                    cell.font = Font(bold=True)
+
+        pastel_palette = [
+            "FFEBEE",
+            "E3F2FD",
+            "E8F5E9",
+            "FFFDE7",
+            "F3E5F5",
+            "FBE9E7",
+            "E0F2F1",
+            "FFF3E0",
+            "F0F4C3",
+            "D1C4E9",
+            "B2EBF2",
+            "FFCCBC",
+            "DCEDC8",
+            "F8BBD0",
+            "C8E6C9",
+            "FFECB3",
+        ]
+        color_cells_by_value("project", pastel_palette)
+        color_cells_by_value("assignee", pastel_palette)
+        color_cells_by_value("labels", pastel_palette)
+        # Completed dropdown
+        if "completed" in col_map:
+            dv_completed = DataValidation(
+                type="list", formula1='"Yes,No"', allow_blank=True
+            )
+            worksheet.add_data_validation(dv_completed)
+            col_letter = get_column_letter(col_map["completed"])
+            dv_completed.add(f"{col_letter}2:{col_letter}{len(df)+1}")
+        # Priority dropdown
+        if "priority" in col_map:
+            dv_priority = DataValidation(
+                type="list", formula1='"1,2,3,4"', allow_blank=True
+            )
+            worksheet.add_data_validation(dv_priority)
+            col_letter = get_column_letter(col_map["priority"])
+            dv_priority.add(f"{col_letter}2:{col_letter}{len(df)+1}")
+
+        # Add dropdowns for labels, project, assignee
+        add_dropdown("labels")
+        add_dropdown("project")
+        add_dropdown("assignee")
+
+        # Only make taskLink column blue and underlined (hyperlink style)
+        if "taskLink" in col_map:
+            col_letter = get_column_letter(col_map["taskLink"])
+            for row in range(2, len(df) + 2):
+                cell = worksheet[f"{col_letter}{row}"]
+                cell.font = Font(color="0000FF", underline="single")
+        # Alternate row color for all other cells
+        alt_row_colors = ["FFFFFF", "F7F7F7"]
+        for row_idx, row in enumerate(
+            worksheet.iter_rows(
+                min_row=2,
+                max_row=worksheet.max_row,
+                min_col=1,
+                max_col=worksheet.max_column,
+            ),
+            start=2,
+        ):
+            row_color = alt_row_colors[(row_idx - 2) % 2]
+            for cell in row:
+                # Don't override if already colored (project, assignee, labels, section, completed)
+                if not cell.fill or cell.fill.start_color.rgb in (
+                    None,
+                    "00000000",
+                    "FFFFFFFF",
+                ):
+                    cell.fill = PatternFill(
+                        start_color=row_color, end_color=row_color, fill_type="solid"
+                    )
+                if not (
+                    cell.alignment
+                    and cell.alignment.vertical == "center"
+                    and cell.alignment.horizontal == "center"
+                ):
+                    cell.alignment = Alignment(wrap_text=True, vertical="top")
+        # Add borders between rows
+        thin = Side(border_style="thin", color="CCCCCC")
+        for row in worksheet.iter_rows(
+            min_row=2,
+            max_row=worksheet.max_row,
+            min_col=1,
+            max_col=worksheet.max_column,
+        ):
+            for cell in row:
+                cell.border = Border(top=thin, bottom=thin, left=thin, right=thin)
+        # Autofit columns
+        for col in worksheet.columns:
+            max_length = 0
+            col_letter = get_column_letter(col[0].column)
+            for cell in col:
+                try:
+                    if cell.value:
+                        max_length = max(max_length, len(str(cell.value)))
+                except Exception:
+                    pass
+            worksheet.column_dimensions[col_letter].width = min(max_length + 2, 50)
+    print(f"Export complete.")
+
+
+def main():
+    with open("credentials.json", "r") as f:
+        credentials = json.load(f)
+    api_token = credentials["api_token"]
+
+    # Fetch all tasks, projects, etc. using Sync API
+    all_tasks = get_all_tasks(api_token)
+    # Get all unique project names (lowercase key)
+    project_names = sorted(
+        set(task["project"] for task in all_tasks if task.get("project"))
+    )
+    print("Available projects:")
+    for idx, pname in enumerate(project_names):
+        print(f"{idx+1}. {pname}")
+    while True:
+        try:
+            selection = int(input("Select a project by number: "))
+            if 1 <= selection <= len(project_names):
+                selected_project_name = project_names[selection - 1]
+                break
+            else:
+                print("Invalid selection. Try again.")
+        except ValueError:
+            print("Please enter a valid number.")
+
+    filtered_tasks = [
+        task for task in all_tasks if task.get("project") == selected_project_name
+    ]
+    if not filtered_tasks:
+        print(f"No tasks found for project '{selected_project_name}'. Exiting.")
+        return
+
+    # Sort by createdDate descending
+    filtered_tasks.sort(key=lambda t: t.get("createdDate", ""), reverse=True)
+
+    # Export to Excel (always overwrite todoist_tasks.xlsx)
+    excel_filename = "todoist_tasks.xlsx"
+    export_to_excel(filtered_tasks, excel_filename)
+
+
+if __name__ == "__main__":
+    main()
