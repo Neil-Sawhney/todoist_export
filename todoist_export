@@ -551,7 +551,12 @@ def export_to_excel(tasks, filename):
 
 
 def main():
-    with open("credentials.json", "r") as f:
+    import os
+
+    # Get the directory where the script resides
+    script_dir = os.path.dirname(os.path.realpath(__file__))
+    credentials_path = os.path.join(script_dir, "credentials.json")
+    with open(credentials_path, "r") as f:
         credentials = json.load(f)
     api_token = credentials["api_token"]
 
@@ -585,8 +590,8 @@ def main():
     # Sort by createdDate descending
     filtered_tasks.sort(key=lambda t: t.get("createdDate", ""), reverse=True)
 
-    # Export to Excel (always overwrite todoist_tasks.xlsx)
-    excel_filename = "todoist_tasks.xlsx"
+    # Export to Excel in the current working directory
+    excel_filename = os.path.join(os.getcwd(), "todoist_tasks.xlsx")
     export_to_excel(filtered_tasks, excel_filename)
 
 
