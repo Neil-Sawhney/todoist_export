@@ -302,7 +302,7 @@ def export_to_excel(tasks, filename):
     if drop_cols:
         df = df.drop(columns=drop_cols)
     col_order = ["parentTask", "taskName", "description", "comments"] + [
-        col for col in df.columns if col not in ("taskName", "description", "comments")
+        col for col in df.columns if col not in ("parentTask", "taskName", "description", "comments")
     ]
     df = df[col_order]
     with pd.ExcelWriter(filename, engine="openpyxl") as writer:
