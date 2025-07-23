@@ -156,12 +156,10 @@ def get_all_tasks(api_token):
         # Task link
         task_link = f'https://todoist.com/showTask?id={item.get("id", "")}'
         task_info = {
+            "parentTask": parent_content,
             "taskId": item.get("id", ""),
             "taskName": item.get("content", ""),
-            "taskLink": task_link,
             "sectionId": section_id or "",
-            "parentTaskId": parent_id or "",
-            "parentTask": parent_content,
             "completed": "Yes" if item.get("is_completed") else "No",
             "due": item["due"]["string"] if item.get("due") else "No due date",
             "priority": item.get("priority", ""),
@@ -173,6 +171,7 @@ def get_all_tasks(api_token):
             "labels": labels,
             "completedDate": completed_at,
             "project": project_name,
+            "taskLink": task_link,
         }
         all_tasks.append(task_info)
 
@@ -216,12 +215,10 @@ def get_all_tasks(api_token):
         comments = "\n".join(comment_list)
         task_link = f'https://todoist.com/showTask?id={citem.get("task_id", "")}'
         task_info = {
+            "parentTask": parent_content,
             "taskId": citem.get("task_id", ""),
             "taskName": content,
-            "taskLink": task_link,
             "sectionId": section_id,
-            "parentTaskId": parent_id,
-            "parentTask": parent_content,
             "completed": "Yes",
             "due": due,
             "priority": priority,
@@ -233,6 +230,7 @@ def get_all_tasks(api_token):
             "labels": labels,
             "completedDate": completed_at,
             "project": project_name,
+            "taskLink": task_link,
         }
         all_tasks.append(task_info)
 
@@ -267,12 +265,10 @@ def get_all_tasks(api_token):
         comments = "\n".join(comment_list)
         task_link = f'https://todoist.com/showTask?id={aitem.get("id", "")}'
         task_info = {
+            "parentTask": parent_content,
             "taskId": aitem.get("id", ""),
             "taskName": content,
-            "taskLink": task_link,
             "sectionId": section_id,
-            "parentTaskId": parent_id,
-            "parentTask": parent_content,
             "completed": "Yes",
             "due": due,
             "priority": priority,
@@ -284,6 +280,7 @@ def get_all_tasks(api_token):
             "labels": labels,
             "completedDate": completed_at,
             "project": project_name,
+            "taskLink": task_link,
         }
         all_tasks.append(task_info)
     print(f"Collected {len(all_tasks)} tasks (active + completed).")
