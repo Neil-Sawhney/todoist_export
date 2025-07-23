@@ -301,7 +301,7 @@ def export_to_excel(tasks, filename):
     drop_cols = [c for c in ("taskId", "sectionId") if c in df.columns]
     if drop_cols:
         df = df.drop(columns=drop_cols)
-    col_order = ["taskName", "description", "comments"] + [
+    col_order = ["parentTask", "taskName", "description", "comments"] + [
         col for col in df.columns if col not in ("taskName", "description", "comments")
     ]
     df = df[col_order]
