@@ -1,28 +1,26 @@
 #!/usr/bin/env python3
 import json
-from datetime import datetime
+import time
+from datetime import datetime, timezone
 
 import pandas as pd
 import requests
 
 
 def get_all_tasks(api_token):
-    import time
-
-    print("Collecting Todoist Tasks using Sync API and completed/get_all...")
+    print("Collecting Todoist Tasks using Sync API...")
     headers = {"Authorization": f"Bearer {api_token}"}
 
-    # 1. Get all active tasks, projects, labels, notes, sections using Sync API
+    # 1. Get all active tasks, projects, labels, sections using Sync API
     sync_url = "https://api.todoist.com/sync/v9/sync"
     sync_data = {
         "sync_token": "*",
         "resource_types": '["all"]',
     }
-    from datetime import datetime, timezone
-
     resp = requests.post(sync_url, headers=headers, data=sync_data)
     resp.raise_for_status()
     result = resp.json()
+
     # Check full_sync_date_utc and do incremental sync if needed
     full_sync_date_utc = result.get("full_sync_date_utc")
     sync_token = result.get("sync_token")
@@ -33,7 +31,6 @@ def get_all_tasks(api_token):
             sync_time = datetime.fromisoformat(
                 full_sync_date_utc.replace("Z", "+00:00")
             )
-            # If the sync is more than 60 seconds old, do incremental sync
             if abs((now_utc - sync_time).total_seconds()) > 60:
                 needs_incremental = True
         except Exception:
@@ -47,21 +44,17 @@ def get_all_tasks(api_token):
         inc_resp = requests.post(sync_url, headers=headers, data=inc_data)
         inc_resp.raise_for_status()
         inc_result = inc_resp.json()
-        # Merge incremental results into main result
         for key in ["items", "projects", "sections", "notes"]:
             if key in inc_result:
                 result.setdefault(key, [])
                 result[key].extend(inc_result[key])
+
     items = result.get("items", [])
     projects = {p["id"]: p["name"] for p in result.get("projects", [])}
     sections = {s["id"]: s["name"] for s in result.get("sections", [])}
-    notes = result.get("notes", [])
-    notes_by_item = {}
-    for note in notes:
-        notes_by_item.setdefault(note["item_id"], []).append(note)
     id_to_item = {item["id"]: item for item in items}
 
-    # Build user id to name mapping (if available)
+    # Build user ID to name mapping
     users = result.get("collaborators", [])
     user_id_to_name = {
         u["id"]: u.get("full_name") or u.get("email") or str(u["id"]) for u in users
@@ -88,10 +81,10 @@ def get_all_tasks(api_token):
         if len(completed_batch) < limit:
             break
         offset += limit
-        time.sleep(0.2)  # avoid rate limits
+        time.sleep(0.2)
     completed_projects = data.get("projects", {})
 
-    # 2b. Get archived completed tasks from /archive/items (new in v9)
+    # 3. Get archived completed tasks from /archive/items
     archive_url = "https://api.todoist.com/sync/v9/archive/items"
     archived_items = []
     offset = 0
@@ -105,7 +98,7 @@ def get_all_tasks(api_token):
             resp = requests.get(archive_url, headers=headers, params=params)
             if resp.status_code == 400:
                 print(
-                    "Warning: /archive/items endpoint not available or not supported for this account. Skipping archived completed tasks."
+                    "Warning: /archive/items endpoint not available. Skipping archived tasks."
                 )
                 archived_items = []
                 break
@@ -121,14 +114,14 @@ def get_all_tasks(api_token):
         print(f"Warning: Failed to fetch archived completed tasks: {e}")
         archived_items = []
 
-    # Deduplicate archived_items and completed_items by task id
+    # Deduplicate archived_items and completed_items by task ID
     completed_ids = set(c.get("task_id") for c in completed_items)
-    # Only add archived items not already in completed_items
     archived_new = [a for a in archived_items if a.get("id") not in completed_ids]
 
-    # 3. Normalize active tasks (include all subtasks, sections, etc.)
+    # 4. Normalize active tasks (without comments for now)
     all_tasks = []
     for item in items:
+        task_id = str(item.get("id", ""))
         created_at = item.get("created_at", "")
         completed_at = item.get("completed_at", "")
         project_id = item.get("project_id")
@@ -143,28 +136,19 @@ def get_all_tasks(api_token):
         assignee = (
             user_id_to_name.get(str(assignee_id), assignee_id) if assignee_id else ""
         )
-        subtasks = [t["content"] for t in items if t.get("parent_id") == item["id"]]
-        comment_list = [n["content"] for n in notes_by_item.get(item["id"], [])]
-        comments = "\n".join(comment_list)
-        attachments = []
-        for n in notes_by_item.get(item["id"], []):
-            if n.get("file_url"):
-                fname = n.get("file_name") or n.get("file_url")
-                attachments.append(f'=HYPERLINK("{n["file_url"]}", "{fname}")')
         labels = ", ".join(item.get("labels", []))
         task_description = item.get("description", "")
-        # Task link
-        task_link = f'https://todoist.com/showTask?id={item.get("id", "")}'
+        task_link = f"https://todoist.com/showTask?id={task_id}"
         task_info = {
             "parentTask": parent_content,
-            "taskId": item.get("id", ""),
+            "taskId": task_id,
             "taskName": item.get("content", ""),
             "sectionId": section_id or "",
             "completed": "Yes" if item.get("is_completed") else "No",
             "due": item["due"]["string"] if item.get("due") else "No due date",
             "priority": item.get("priority", ""),
             "description": task_description,
-            "comments": comments,
+            "comments": "",  # Will be populated later
             "section": section_name,
             "assignee": assignee,
             "createdDate": created_at,
@@ -175,9 +159,9 @@ def get_all_tasks(api_token):
         }
         all_tasks.append(task_info)
 
-    # 4. Normalize completed tasks
+    # 5. Normalize completed tasks
     for citem in completed_items:
-        # If annotate_items is true, use the full item object for more details
+        task_id = str(citem.get("task_id", ""))
         item_obj = citem.get("item_object", {})
         content = citem.get("content") or item_obj.get("content", "")
         description = item_obj.get("description", "")
@@ -188,11 +172,9 @@ def get_all_tasks(api_token):
         section_id = item_obj.get("section_id") or ""
         section_name = sections.get(section_id, "") if section_id else ""
         parent_id = item_obj.get("parent_id") or ""
-        parent_content = item_obj.get("parent_content", "")
-        if not parent_content and parent_id:
-            parent_content = (
-                id_to_item[parent_id]["content"] if parent_id in id_to_item else ""
-            )
+        parent_content = item_obj.get("parent_content", "") or (
+            id_to_item[parent_id]["content"] if parent_id in id_to_item else ""
+        )
         assignee_id = (
             item_obj.get("responsible_uid") or item_obj.get("assignee_id") or ""
         )
@@ -208,22 +190,17 @@ def get_all_tasks(api_token):
             if item_obj.get("due")
             else "No due date"
         )
-        # Comments for completed tasks
-        comment_list = [
-            n["content"] for n in notes_by_item.get(citem.get("task_id", ""), [])
-        ]
-        comments = "\n".join(comment_list)
-        task_link = f'https://todoist.com/showTask?id={citem.get("task_id", "")}'
+        task_link = f"https://todoist.com/showTask?id={task_id}"
         task_info = {
             "parentTask": parent_content,
-            "taskId": citem.get("task_id", ""),
+            "taskId": task_id,
             "taskName": content,
             "sectionId": section_id,
             "completed": "Yes",
             "due": due,
             "priority": priority,
             "description": description,
-            "comments": comments,
+            "comments": "",  # Will be populated later
             "section": section_name,
             "assignee": assignee,
             "createdDate": created_at,
@@ -234,9 +211,9 @@ def get_all_tasks(api_token):
         }
         all_tasks.append(task_info)
 
-    # 5. Normalize archived completed tasks
+    # 6. Normalize archived completed tasks
     for aitem in archived_new:
-        # archived items are in the same format as active items, but are completed
+        task_id = str(aitem.get("id", ""))
         content = aitem.get("content", "")
         description = aitem.get("description", "")
         project_id = aitem.get("project_id", "")
@@ -258,22 +235,17 @@ def get_all_tasks(api_token):
         priority = aitem.get("priority", "")
         labels = ", ".join(aitem.get("labels", []))
         due = aitem.get("due", {}).get("string") if aitem.get("due") else "No due date"
-        # Comments for archived completed tasks
-        comment_list = [
-            n["content"] for n in notes_by_item.get(aitem.get("id", ""), [])
-        ]
-        comments = "\n".join(comment_list)
-        task_link = f'https://todoist.com/showTask?id={aitem.get("id", "")}'
+        task_link = f"https://todoist.com/showTask?id={task_id}"
         task_info = {
             "parentTask": parent_content,
-            "taskId": aitem.get("id", ""),
+            "taskId": task_id,
             "taskName": content,
             "sectionId": section_id,
             "completed": "Yes",
             "due": due,
             "priority": priority,
             "description": description,
-            "comments": comments,
+            "comments": "",  # Will be populated later
             "section": section_name,
             "assignee": assignee,
             "createdDate": created_at,
@@ -283,8 +255,16 @@ def get_all_tasks(api_token):
             "taskLink": task_link,
         }
         all_tasks.append(task_info)
+
     print(f"Collected {len(all_tasks)} tasks (active + completed).")
-    return all_tasks
+    return (
+        all_tasks,
+        projects,
+        completed_projects,
+        sections,
+        id_to_item,
+        user_id_to_name,
+    )
 
 
 def export_to_excel(tasks, filename):
@@ -302,7 +282,9 @@ def export_to_excel(tasks, filename):
     if drop_cols:
         df = df.drop(columns=drop_cols)
     col_order = ["parentTask", "taskName", "description", "comments"] + [
-        col for col in df.columns if col not in ("parentTask", "taskName", "description", "comments")
+        col
+        for col in df.columns
+        if col not in ("parentTask", "taskName", "description", "comments")
     ]
     df = df[col_order]
     with pd.ExcelWriter(filename, engine="openpyxl") as writer:
@@ -558,7 +540,10 @@ def main():
     api_token = credentials["api_token"]
 
     # Fetch all tasks, projects, etc. using Sync API
-    all_tasks = get_all_tasks(api_token)
+    all_tasks, projects, completed_projects, sections, id_to_item, user_id_to_name = (
+        get_all_tasks(api_token)
+    )
+
     # Get all unique project names (lowercase key)
     project_names = sorted(
         set(task["project"] for task in all_tasks if task.get("project"))
@@ -577,12 +562,51 @@ def main():
         except ValueError:
             print("Please enter a valid number.")
 
+    # Filter tasks by selected project
     filtered_tasks = [
         task for task in all_tasks if task.get("project") == selected_project_name
     ]
     if not filtered_tasks:
         print(f"No tasks found for project '{selected_project_name}'. Exiting.")
         return
+
+    # Fetch comments for filtered tasks using REST API v2
+    print(
+        f"Fetching comments for {len(filtered_tasks)} tasks in project '{selected_project_name}'..."
+    )
+    headers = {"Authorization": f"Bearer {api_token}"}
+    comments_url = "https://api.todoist.com/rest/v2/comments"
+    tasks_with_comments = []
+    for task in filtered_tasks:
+        task_id = task["taskId"]
+        try:
+            params = {"task_id": task_id}
+            resp = requests.get(comments_url, headers=headers, params=params)
+            if resp.status_code == 404:
+                task["comments"] = ""
+                continue
+            resp.raise_for_status()
+            comments = resp.json()
+            comment_list = [c["content"] for c in comments]
+            task["comments"] = "\n".join(comment_list)
+            if comments:
+                tasks_with_comments.append(task)
+                print(
+                    f"Fetched {len(comments)} comments for task {task_id} ({task['taskName']})"
+                )
+            time.sleep(0.1)  # Avoid rate limits
+        except Exception as e:
+            print(f"Failed to fetch comments for task {task_id}: {e}")
+            task["comments"] = ""
+
+    # Debugging: Log tasks with comments
+    print(
+        f"Found {len(tasks_with_comments)} tasks with comments out of {len(filtered_tasks)} tasks in project '{selected_project_name}'."
+    )
+    for task in tasks_with_comments:
+        print(
+            f"Task {task['taskId']} ({task['taskName']}, completed: {task['completed']}): {task['comments']}"
+        )
 
     # Sort by createdDate descending
     filtered_tasks.sort(key=lambda t: t.get("createdDate", ""), reverse=True)
